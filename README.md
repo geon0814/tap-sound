@@ -13,6 +13,8 @@ something fun and useful.
   limit, an audible beep speeds up smoothly (exponential curve), just like a car's
   reversing sensor. The thresholds (`LID_DANGER_START` / `LID_DANGER_MAX`) were tuned for a
   **MacBook Air M4 13"** and may need adjusting on other models.
+- **Trackpad haptic feedback** - each warning beep is paired with a short haptic tap via
+  `NSHapticFeedbackManager` (raw ObjC runtime call) on Force Touch trackpads.
 - **Ambient light sensor** - real-time lux reading.
 - **Battery** - percentage, temperature, voltage/current, charging state, cycle count
   (via `ioreg`).
