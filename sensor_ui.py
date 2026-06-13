@@ -77,6 +77,27 @@ def read_thermal_state():
     return _THERMAL_STATES.get(state, f"Unknown({state})")
 
 
+# --- NSHapticFeedbackManager (Force Touch trackpad haptic, raw ObjC runtime call) ---
+ctypes.cdll.LoadLibrary("/System/Library/Frameworks/AppKit.framework/AppKit")
+
+_send_void_ll = ctypes.CFUNCTYPE(
+    None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long, ctypes.c_long
+)(_msg_send_ptr)
+
+_NSHapticFeedbackManager = _objc.objc_getClass(b"NSHapticFeedbackManager")
+_sel_defaultPerformer = _objc.sel_registerName(b"defaultPerformer")
+_sel_performFeedback = _objc.sel_registerName(b"performFeedbackPattern:performanceTime:")
+
+NS_HAPTIC_PATTERN_GENERIC = 0
+NS_HAPTIC_PERFORMANCE_TIME_NOW = 1
+
+
+def trigger_haptic():
+    """Fire a short haptic tap on the Force Touch trackpad."""
+    performer = _send_obj(_NSHapticFeedbackManager, _sel_defaultPerformer)
+    _send_void_ll(performer, _sel_performFeedback, NS_HAPTIC_PATTERN_GENERIC, NS_HAPTIC_PERFORMANCE_TIME_NOW)
+
+
 def play_random_sound():
     subprocess.Popen(
         ["afplay", random.choice(SOUNDS)],
@@ -249,6 +270,7 @@ class SensorUI(tk.Tk):
                         ["afplay", LID_BEEP_SOUND],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     )
+                    trigger_haptic()
                     self.lid_beep_cooldown = interval
             else:
                 self.lid_label.config(text=f"Lid angle: {angle:.1f}°", fg="black")
