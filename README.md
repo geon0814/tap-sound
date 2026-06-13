@@ -15,6 +15,10 @@ something fun and useful.
   **MacBook Air M4 13"** and may need adjusting on other models.
 - **Trackpad haptic feedback** - each warning beep is paired with a short haptic tap via
   `NSHapticFeedbackManager` (raw ObjC runtime call) on Force Touch trackpads.
+- **Keyboard backlight flash** - while the warning is active, the keyboard backlight
+  flashes in sync with each beep via `KeyboardBrightnessClient` (raw ObjC runtime call,
+  `CoreBrightness.framework`), then restores the original brightness once the lid
+  returns to a safe angle.
 - **Ambient light sensor** - real-time lux reading.
 - **Battery** - percentage, temperature, voltage/current, charging state, cycle count
   (via `ioreg`).

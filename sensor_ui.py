@@ -98,6 +98,38 @@ def trigger_haptic():
     _send_void_ll(performer, _sel_performFeedback, NS_HAPTIC_PATTERN_GENERIC, NS_HAPTIC_PERFORMANCE_TIME_NOW)
 
 
+# --- KeyboardBrightnessClient (keyboard backlight, raw ObjC runtime call) ---
+ctypes.cdll.LoadLibrary("/System/Library/PrivateFrameworks/CoreBrightness.framework/CoreBrightness")
+
+_sel_alloc = _objc.sel_registerName(b"alloc")
+_sel_init = _objc.sel_registerName(b"init")
+_send_alloc_init = lambda cls: _send_obj(_send_obj(cls, _sel_alloc), _sel_init)
+
+_send_float_int = ctypes.CFUNCTYPE(
+    ctypes.c_float, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int
+)(_msg_send_ptr)
+_send_void_float_int = ctypes.CFUNCTYPE(
+    None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_float, ctypes.c_int
+)(_msg_send_ptr)
+
+_KeyboardBrightnessClient = _objc.objc_getClass(b"KeyboardBrightnessClient")
+_sel_getKeyboardBrightness = _objc.sel_registerName(b"brightnessForKeyboard:")
+_sel_setKeyboardBrightness = _objc.sel_registerName(b"setBrightness:forKeyboard:")
+_kbd_brightness_client = _send_alloc_init(_KeyboardBrightnessClient)
+
+KEYBOARD_BACKLIGHT_ID = 2  # the internal keyboard, found by probing IDs 0-4
+
+
+def read_keyboard_brightness():
+    """Current keyboard backlight brightness (0.0-1.0)."""
+    return _send_float_int(_kbd_brightness_client, _sel_getKeyboardBrightness, KEYBOARD_BACKLIGHT_ID)
+
+
+def set_keyboard_brightness(value):
+    """Set the keyboard backlight brightness (0.0-1.0)."""
+    _send_void_float_int(_kbd_brightness_client, _sel_setKeyboardBrightness, value, KEYBOARD_BACKLIGHT_ID)
+
+
 def play_random_sound():
     subprocess.Popen(
         ["afplay", random.choice(SOUNDS)],
@@ -184,6 +216,8 @@ class SensorUI(tk.Tk):
         self.cooldown_left = 0
         self.last_lid_angle = None
         self.lid_beep_cooldown = 0
+        self.kbd_brightness_saved = None
+        self.kbd_flash_on = False
         self.power = PowerMonitor()
 
         self._build_widgets()
@@ -262,6 +296,9 @@ class SensorUI(tk.Tk):
             angle = self.last_lid_angle
             interval = lid_beep_interval(angle)
             if interval is not None:
+                if self.kbd_brightness_saved is None:
+                    self.kbd_brightness_saved = read_keyboard_brightness()
+
                 warn = "Danger! Stop opening" if angle >= LID_DANGER_MAX else "Caution: near limit"
                 self.lid_label.config(text=f"Lid angle: {angle:.1f}°  -  {warn}", fg="red")
                 self.lid_beep_cooldown -= POLL_MS
@@ -271,10 +308,15 @@ class SensorUI(tk.Tk):
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     )
                     trigger_haptic()
+                    self.kbd_flash_on = not self.kbd_flash_on
+                    set_keyboard_brightness(1.0 if self.kbd_flash_on else 0.0)
                     self.lid_beep_cooldown = interval
             else:
                 self.lid_label.config(text=f"Lid angle: {angle:.1f}°", fg="black")
                 self.lid_beep_cooldown = 0
+                if self.kbd_brightness_saved is not None:
+                    set_keyboard_brightness(self.kbd_brightness_saved)
+                    self.kbd_brightness_saved = None
 
         # Ambient light (a new value only arrives when it changes)
         als = self.imu.read_als()
