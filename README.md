@@ -15,6 +15,9 @@ something fun and useful.
   **MacBook Air M4 13"** and may need adjusting on other models.
 - **Trackpad haptic feedback** - each warning beep is paired with a short haptic tap via
   `NSHapticFeedbackManager` (raw ObjC runtime call) on Force Touch trackpads.
+  > **Known limitation**: macOS only fires the Taptic Engine while it detects a finger
+  > on the trackpad (capacitive touch) - this is by design, so the haptic only helps
+  > when a hand is resting on the trackpad.
 - **Keyboard backlight flash** - while the warning is active, the keyboard backlight
   flashes in sync with each beep via `KeyboardBrightnessClient` (raw ObjC runtime call,
   `CoreBrightness.framework`), then restores the original brightness once the lid
