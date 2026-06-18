@@ -154,6 +154,8 @@ def read_battery():
         "percent": data["CurrentCapacity"],
         "cycle_count": data["CycleCount"],
         "is_charging": data["IsCharging"],
+        # "Maximum Capacity" as shown in System Settings > Battery > Battery Health
+        "max_capacity_pct": data["AppleRawMaxCapacity"] / data["DesignCapacity"] * 100.0,
     }
 
 
@@ -177,7 +179,9 @@ def read_wifi():
 class PowerMonitor:
     """Continuously runs powermetrics in the background to track CPU/GPU/ANE power (W)."""
 
-    _LINE_RE = re.compile(r"^(CPU|GPU|ANE) Power:\s*(\d+)\s*mW")
+    # optional "E-" / "P-" prefix handles Apple Silicon per-cluster lines
+    _POWER_RE = re.compile(r"^(?:[A-Z]-)?(CPU|GPU|ANE) Power:\s*(\d+)\s*mW")
+    _SAMPLE_RE = re.compile(r"^\*{3} Sampled")
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -189,12 +193,24 @@ class PowerMonitor:
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
+        cpu_acc = 0.0
         for line in self._proc.stdout:
-            m = self._LINE_RE.match(line.strip())
-            if m:
-                key = {"CPU": "cpu_W", "GPU": "gpu_W", "ANE": "ane_W"}[m.group(1)]
+            line = line.strip()
+            if self._SAMPLE_RE.match(line):
                 with self._lock:
-                    self._data[key] = int(m.group(2)) / 1000.0
+                    self._data["cpu_W"] = cpu_acc
+                cpu_acc = 0.0
+                continue
+            m = self._POWER_RE.match(line)
+            if not m:
+                continue
+            kind, mw = m.group(1), int(m.group(2)) / 1000.0
+            if kind == "CPU":
+                cpu_acc += mw
+            else:
+                key = "gpu_W" if kind == "GPU" else "ane_W"
+                with self._lock:
+                    self._data[key] = mw
 
     def read(self):
         with self._lock:
@@ -325,8 +341,9 @@ class SensorUI(tk.Tk):
 
         # CPU/GPU/ANE power (continuously updated by the background powermetrics thread)
         p = self.power.read()
+        cpu_str = f"{p['cpu_W']:.2f}W (N/A macOS 26b bug)" if p['cpu_W'] == 0.0 else f"{p['cpu_W']:.2f}W"
         self.power_label.config(
-            text=f"Power: CPU {p['cpu_W']:.2f}W  /  GPU {p['gpu_W']:.2f}W  /  ANE {p['ane_W']:.2f}W"
+            text=f"Power: CPU {cpu_str}  /  GPU {p['gpu_W']:.2f}W  /  ANE {p['ane_W']:.2f}W"
         )
 
         self.after(POLL_MS, self._poll)
@@ -339,7 +356,8 @@ class SensorUI(tk.Tk):
             self.battery_label.config(
                 text=(
                     f"Battery: {battery['percent']}%  |  {battery['temperature']:.1f}°C  |  "
-                    f"{battery['amperage']:+d}mA ({state})  |  Cycle {battery['cycle_count']}"
+                    f"{battery['amperage']:+d}mA ({state})  |  Cycle {battery['cycle_count']}  |  "
+                    f"Max capacity {battery['max_capacity_pct']:.1f}%"
                 )
             )
 
