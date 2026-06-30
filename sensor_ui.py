@@ -147,15 +147,24 @@ def read_battery():
     if not items:
         return None
     data = items[0]
+    # macOS 26 beta moved capacity fields into a nested "BatteryData" dict and
+    # dropped the top-level "Temperature" key - fall back gracefully either way.
+    nested = data.get("BatteryData", {})
+    design_capacity = nested.get("DesignCapacity", data.get("DesignCapacity"))
+    max_capacity = nested.get("FullChargeCapacity", data.get("AppleRawMaxCapacity"))
+    temperature = data.get("Temperature")
+
     return {
-        "temperature": data["Temperature"] / 100.0,
+        "temperature": temperature / 100.0 if temperature is not None else None,
         "voltage": data["Voltage"] / 1000.0,
         "amperage": data["Amperage"],
         "percent": data["CurrentCapacity"],
         "cycle_count": data["CycleCount"],
         "is_charging": data["IsCharging"],
         # "Maximum Capacity" as shown in System Settings > Battery > Battery Health
-        "max_capacity_pct": data["AppleRawMaxCapacity"] / data["DesignCapacity"] * 100.0,
+        "max_capacity_pct": (
+            max_capacity / design_capacity * 100.0 if design_capacity else None
+        ),
     }
 
 
@@ -353,11 +362,13 @@ class SensorUI(tk.Tk):
         battery = read_battery()
         if battery is not None:
             state = "Charging" if battery["is_charging"] else "Discharging"
+            temp_str = f"{battery['temperature']:.1f}°C" if battery["temperature"] is not None else "N/A"
+            health_str = f"{battery['max_capacity_pct']:.1f}%" if battery["max_capacity_pct"] is not None else "N/A"
             self.battery_label.config(
                 text=(
-                    f"Battery: {battery['percent']}%  |  {battery['temperature']:.1f}°C  |  "
+                    f"Battery: {battery['percent']}%  |  {temp_str}  |  "
                     f"{battery['amperage']:+d}mA ({state})  |  Cycle {battery['cycle_count']}  |  "
-                    f"Max capacity {battery['max_capacity_pct']:.1f}%"
+                    f"Max capacity {health_str}"
                 )
             )
 
