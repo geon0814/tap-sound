@@ -1,8 +1,5 @@
 # tap-sound
-
-A little Tkinter desktop app that taps into the hidden sensors of Apple Silicon MacBooks
-(via the [`macimu`](https://pypi.org/project/macimu/) IOKit/HID bridge) and turns them into
-something fun and useful.
+Explore the hidden sensors inside Apple Silicon MacBooks — accelerometer, lid angle, ambient light, battery telemetry, Wi-Fi, thermal state, power usage, haptics, and more. A lightweight Tkinter desktop app powered by the [macimu](https://pypi.org/project/macimu/) IOKit/HID bridge) IOKit/HID bridge that turns low-level hardware sensors into fun, interactive features.
 
 ## Features
 
