@@ -24,25 +24,20 @@ SOUNDS = [
 ]
 
 POLL_MS = 30          # UI refresh interval (ms)
-SLOW_POLL_MS = 2000   # battery/Wi-Fi/thermal refresh interval (ms) - no need to call often
+SLOW_POLL_MS = 2000   # battery/Wi-Fi/thermal refresh interval (ms)
 COOLDOWN_MS = 250     # minimum wait before the next tap can trigger (ms)
 
-# Lid-angle warning beep (parking-sensor style - beeps faster near the hinge limit)
-# NOTE: these angle thresholds were tuned on a MacBook Air M4 13" - the actual
-# hinge limit may vary on other models.
-LID_DANGER_START = 125.0  # beeping starts at this angle (near the hinge limit)
-LID_DANGER_MAX = 132.0    # fastest beep at/above this angle (needs force to open further - danger!)
+LID_DANGER_START = 125.0
+LID_DANGER_MAX = 132.0
 LID_BEEP_SLOW_MS = 1000
 LID_BEEP_FAST_MS = 80
 LID_BEEP_SOUND = "/System/Library/Sounds/Tink.aiff"
 
+# Pressure state — written by NSEvent handler (main thread), read by _poll (main thread)
+_pressure = {"value": 0.0}
+
 
 def lid_beep_interval(angle):
-    """Beep interval (ms) for the given lid angle, or None if within the safe range.
-
-    The interval shrinks by a constant ratio per degree (exponential curve),
-    giving a smooth, parking-sensor-like acceleration.
-    """
     if angle < LID_DANGER_START:
         return None
     if angle >= LID_DANGER_MAX:
@@ -50,7 +45,8 @@ def lid_beep_interval(angle):
     ratio = (angle - LID_DANGER_START) / (LID_DANGER_MAX - LID_DANGER_START)
     return LID_BEEP_SLOW_MS * (LID_BEEP_FAST_MS / LID_BEEP_SLOW_MS) ** ratio
 
-# --- NSProcessInfo.thermalState (raw ObjC runtime calls, no sudo/extra deps needed) ---
+
+# --- NSProcessInfo.thermalState ---
 _objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
 ctypes.cdll.LoadLibrary("/System/Library/Frameworks/Foundation.framework/Foundation")
 
@@ -67,7 +63,6 @@ _NSProcessInfo = _objc.objc_getClass(b"NSProcessInfo")
 _sel_processInfo = _objc.sel_registerName(b"processInfo")
 _sel_thermalState = _objc.sel_registerName(b"thermalState")
 
-# NSProcessInfoThermalState: 0=Nominal, 1=Fair, 2=Serious, 3=Critical
 _THERMAL_STATES = {0: "Nominal", 1: "Fair", 2: "Serious", 3: "Critical (throttling)"}
 
 
@@ -77,7 +72,7 @@ def read_thermal_state():
     return _THERMAL_STATES.get(state, f"Unknown({state})")
 
 
-# --- NSHapticFeedbackManager (Force Touch trackpad haptic, raw ObjC runtime call) ---
+# --- NSHapticFeedbackManager ---
 ctypes.cdll.LoadLibrary("/System/Library/Frameworks/AppKit.framework/AppKit")
 
 _send_void_ll = ctypes.CFUNCTYPE(
@@ -93,12 +88,11 @@ NS_HAPTIC_PERFORMANCE_TIME_NOW = 1
 
 
 def trigger_haptic():
-    """Fire a short haptic tap on the Force Touch trackpad."""
     performer = _send_obj(_NSHapticFeedbackManager, _sel_defaultPerformer)
     _send_void_ll(performer, _sel_performFeedback, NS_HAPTIC_PATTERN_GENERIC, NS_HAPTIC_PERFORMANCE_TIME_NOW)
 
 
-# --- KeyboardBrightnessClient (keyboard backlight, raw ObjC runtime call) ---
+# --- KeyboardBrightnessClient ---
 ctypes.cdll.LoadLibrary("/System/Library/PrivateFrameworks/CoreBrightness.framework/CoreBrightness")
 
 _sel_alloc = _objc.sel_registerName(b"alloc")
@@ -117,16 +111,14 @@ _sel_getKeyboardBrightness = _objc.sel_registerName(b"brightnessForKeyboard:")
 _sel_setKeyboardBrightness = _objc.sel_registerName(b"setBrightness:forKeyboard:")
 _kbd_brightness_client = _send_alloc_init(_KeyboardBrightnessClient)
 
-KEYBOARD_BACKLIGHT_ID = 2  # the internal keyboard, found by probing IDs 0-4
+KEYBOARD_BACKLIGHT_ID = 2
 
 
 def read_keyboard_brightness():
-    """Current keyboard backlight brightness (0.0-1.0)."""
     return _send_float_int(_kbd_brightness_client, _sel_getKeyboardBrightness, KEYBOARD_BACKLIGHT_ID)
 
 
 def set_keyboard_brightness(value):
-    """Set the keyboard backlight brightness (0.0-1.0)."""
     _send_void_float_int(_kbd_brightness_client, _sel_setKeyboardBrightness, value, KEYBOARD_BACKLIGHT_ID)
 
 
@@ -138,7 +130,6 @@ def play_random_sound():
 
 
 def read_battery():
-    """Read battery info from ioreg. (Temperature is in 1/100 deg C, Amperage in mA)"""
     out = subprocess.run(
         ["ioreg", "-r", "-c", "AppleSmartBattery", "-a"],
         capture_output=True, check=True,
@@ -147,8 +138,6 @@ def read_battery():
     if not items:
         return None
     data = items[0]
-    # macOS 26 beta moved capacity fields into a nested "BatteryData" dict and
-    # dropped the top-level "Temperature" key - fall back gracefully either way.
     nested = data.get("BatteryData", {})
     design_capacity = nested.get("DesignCapacity", data.get("DesignCapacity"))
     max_capacity = nested.get("FullChargeCapacity", data.get("AppleRawMaxCapacity"))
@@ -161,7 +150,6 @@ def read_battery():
         "percent": data["CurrentCapacity"],
         "cycle_count": data["CycleCount"],
         "is_charging": data["IsCharging"],
-        # "Maximum Capacity" as shown in System Settings > Battery > Battery Health
         "max_capacity_pct": (
             max_capacity / design_capacity * 100.0 if design_capacity else None
         ),
@@ -169,7 +157,6 @@ def read_battery():
 
 
 def read_wifi():
-    """Read Wi-Fi RSSI/channel etc. from wdutil info. (values are populated only when running as root)"""
     out = subprocess.run(
         ["wdutil", "info"], capture_output=True, text=True,
     ).stdout
@@ -186,9 +173,6 @@ def read_wifi():
 
 
 class PowerMonitor:
-    """Continuously runs powermetrics in the background to track CPU/GPU/ANE power (W)."""
-
-    # optional "E-" / "P-" prefix handles Apple Silicon per-cluster lines
     _POWER_RE = re.compile(r"^(?:[A-Z]-)?(CPU|GPU|ANE) Power:\s*(\d+)\s*mW")
     _SAMPLE_RE = re.compile(r"^\*{3} Sampled")
 
@@ -229,6 +213,15 @@ class PowerMonitor:
         self._proc.terminate()
 
 
+def _pressure_color(v):
+    # 0.0 → 파란색(#4a9eff), 1.0 → 빨간색(#ff3030)
+    r = int(0x4a + (0xff - 0x4a) * v)
+    g = int(0x9e + (0x30 - 0x9e) * v)
+    b = int(0xff + (0x30 - 0xff) * v)
+    return f"#{r:02x}{g:02x}{b:02x}"
+_BAR_W = 260
+
+
 class SensorUI(tk.Tk):
     def __init__(self, imu: IMU):
         super().__init__()
@@ -247,8 +240,79 @@ class SensorUI(tk.Tk):
 
         self._build_widgets()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Lazy import: AppKit must be imported AFTER tk.Tk() so Tkinter's NSApplication
+        # subclass is already registered before pyobjc wraps it
+        self._setup_pressure_monitor()
         self._poll()
         self._poll_slow()
+
+    def _setup_pressure_monitor(self):
+        try:
+            _mt = ctypes.cdll.LoadLibrary(
+                "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport"
+            )
+        except OSError as e:
+            print(f"[pressure] MultitouchSupport load failed: {e}")
+            return
+
+        _cf = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+        _cf.CFArrayGetCount.restype = ctypes.c_long
+        _cf.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+        _cf.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+        _cf.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+        _cf.CFRunLoopRun.restype = None
+        _cf.CFRunLoopRun.argtypes = []
+
+        _mt.MTDeviceCreateList.restype = ctypes.c_void_p
+        _mt.MTRegisterContactFrameCallback.restype = None
+        _mt.MTRegisterContactFrameCallback.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        _mt.MTDeviceStart.restype = None
+        _mt.MTDeviceStart.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+        _MT_CB = ctypes.CFUNCTYPE(
+            ctypes.c_int,
+            ctypes.c_void_p,  # device
+            ctypes.c_void_p,  # contacts[]
+            ctypes.c_int,     # nFingers
+            ctypes.c_double,  # timestamp
+            ctypes.c_int,     # frame
+        )
+
+        CONTACT_SIZE = 96
+        PRESSURE_OFF = 92
+
+        def _mt_callback(device, contacts, n_fingers, timestamp, frame):
+            if contacts is None or n_fingers == 0:
+                _pressure["value"] = 0.0
+                return 0
+            max_raw = 0.0
+            for i in range(n_fingers):
+                raw = ctypes.cast(
+                    contacts + i * CONTACT_SIZE + PRESSURE_OFF,
+                    ctypes.POINTER(ctypes.c_float),
+                )[0]
+                if raw > max_raw:
+                    max_raw = raw
+            _pressure["value"] = min(max_raw / 2.0, 1.0)
+            return 0
+
+        cb = _MT_CB(_mt_callback)
+        self._mt_callback_ref = cb  # prevent GC
+
+        devices = _mt.MTDeviceCreateList()
+        n_devices = _cf.CFArrayGetCount(devices)
+
+        def _run():
+            for i in range(n_devices):
+                dev = _cf.CFArrayGetValueAtIndex(devices, i)
+                _mt.MTRegisterContactFrameCallback(dev, cb)
+                _mt.MTDeviceStart(dev, 0)
+            print(f"[pressure] MultitouchSupport: {n_devices} device(s) started")
+            _cf.CFRunLoopRun()
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _on_close(self):
         self.power.stop()
@@ -257,13 +321,14 @@ class SensorUI(tk.Tk):
     def _build_widgets(self):
         pad = {"padx": 16, "pady": 6}
 
+        # --- Tap detection ---
         tk.Label(self, text="Acceleration delta (g)", font=("Helvetica", 12)).pack(**pad)
         self.delta_label = tk.Label(self, text="0.000", font=("Helvetica", 28))
         self.delta_label.pack()
 
         tk.Label(self, text="Threshold - a change larger than this is detected as a 'tap'").pack()
         tk.Scale(self, from_=0.05, to=1.0, resolution=0.01,
-                 orient="horizontal", length=260,
+                 orient="horizontal", length=_BAR_W,
                  variable=self.threshold).pack(**pad)
 
         self.tap_label = tk.Label(self, text="Tap! 0", font=("Helvetica", 16), fg="gray")
@@ -271,6 +336,25 @@ class SensorUI(tk.Tk):
 
         tk.Frame(self, height=2, bd=1, relief="sunken").pack(fill="x", padx=10, pady=8)
 
+        # --- Trackpad pressure ---
+        tk.Label(self, text="Trackpad Pressure", font=("Helvetica", 12)).pack(**pad)
+        self.pressure_canvas = tk.Canvas(
+            self, width=_BAR_W, height=26,
+            highlightthickness=1, highlightbackground="#aaa",
+        )
+        self.pressure_canvas.pack(**pad)
+        self.pressure_bar = self.pressure_canvas.create_rectangle(0, 0, 0, 26, fill="#4a9eff", outline="")
+        self.pressure_info = tk.Label(self, text="0.000  |  —", font=("Helvetica", 14))
+        self.pressure_info.pack(**pad)
+        tk.Label(
+            self,
+            text="No response? System Settings > Privacy > Accessibility > Terminal",
+            font=("Helvetica", 10), fg="gray",
+        ).pack()
+
+        tk.Frame(self, height=2, bd=1, relief="sunken").pack(fill="x", padx=10, pady=8)
+
+        # --- Lid / ALS ---
         self.lid_label = tk.Label(self, text="Lid angle: measuring...", font=("Helvetica", 14))
         self.lid_label.pack(**pad)
 
@@ -279,6 +363,7 @@ class SensorUI(tk.Tk):
 
         tk.Frame(self, height=2, bd=1, relief="sunken").pack(fill="x", padx=10, pady=8)
 
+        # --- Battery / Wi-Fi ---
         self.battery_label = tk.Label(self, text="Battery: measuring...", font=("Helvetica", 14))
         self.battery_label.pack(**pad)
 
@@ -287,6 +372,7 @@ class SensorUI(tk.Tk):
 
         tk.Frame(self, height=2, bd=1, relief="sunken").pack(fill="x", padx=10, pady=8)
 
+        # --- Power / Thermal ---
         self.power_label = tk.Label(self, text="Power: measuring...", font=("Helvetica", 14))
         self.power_label.pack(**pad)
 
@@ -312,7 +398,7 @@ class SensorUI(tk.Tk):
         if self.cooldown_left > 0:
             self.cooldown_left -= POLL_MS
 
-        # Lid angle (a new value only arrives when it changes)
+        # Lid angle
         lid = self.imu.read_lid()
         if lid is not None:
             self.last_lid_angle = lid
@@ -343,14 +429,21 @@ class SensorUI(tk.Tk):
                     set_keyboard_brightness(self.kbd_brightness_saved)
                     self.kbd_brightness_saved = None
 
-        # Ambient light (a new value only arrives when it changes)
+        # Ambient light
         als = self.imu.read_als()
         if als is not None:
             self.als_label.config(text=f"Light: {als.lux:.0f} lux")
 
-        # CPU/GPU/ANE power (continuously updated by the background powermetrics thread)
+        # Trackpad pressure
+        pval = _pressure["value"]
+        bar_w = int(_BAR_W * pval)
+        self.pressure_canvas.coords(self.pressure_bar, 0, 0, bar_w, 26)
+        self.pressure_canvas.itemconfig(self.pressure_bar, fill=_pressure_color(pval))
+        self.pressure_info.config(text=f"{pval:.3f}")
+
+        # CPU/GPU/ANE power
         p = self.power.read()
-        cpu_str = f"{p['cpu_W']:.2f}W (N/A macOS 26b bug)" if p['cpu_W'] == 0.0 else f"{p['cpu_W']:.2f}W"
+        cpu_str = f"{p['cpu_W']:.2f}W (N/A macOS 27 dev golden b bug)" if p['cpu_W'] == 0.0 else f"{p['cpu_W']:.2f}W"
         self.power_label.config(
             text=f"Power: CPU {cpu_str}  /  GPU {p['gpu_W']:.2f}W  /  ANE {p['ane_W']:.2f}W"
         )
