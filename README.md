@@ -139,33 +139,73 @@ exactly +96.
 
 ### Experimental results
 
-Session-peak values measured on MacBook Air M4 (offset 92 and offset 48 simultaneously):
+87 session-peak measurements collected on MacBook Air M4 across 19 contact
+categories (offset 92 and offset 48 simultaneously). Each row is the within-session
+maximum for the contact with the highest raw value.
 
-| Interaction | raw (offset 92) | size (offset 48) | ratio (raw/size) |
+| Contact type | n | avg size | avg ratio |
 |---|---|---|---|
-| Light finger touch | 1.61 | 0.71 | 2.28 |
-| Normal click | 1.58 | 0.75 | 2.12 |
-| Force Click | 1.54 | 0.80 | 1.91 |
-| Palm (centered) | 4.50 | 45.13 | 0.10 |
+| Feather touch | 2 | 0.26 | 2.38 |
+| Fingernail | 1 | 0.23 | 2.36 |
+| Fingertip vertical (all 4 fingers) | 11 | 0.50 | 2.35 |
+| Resting touch | 2 | 0.52 | 2.28 |
+| Force Click haptic artifact | 2 | 0.09 | 2.38 |
+| Light click | 2 | 0.73 | 2.04 |
+| Normal click | 5 | 0.74 | 2.13 |
+| Hard click | 2 | 0.79 | 1.89 |
+| Force Click (slow / sustained) | 12 | 1.01 | 1.59 |
+| Corner / edge touches | 12 | 0.78 | 1.73 |
+| 2-finger adjacent | 5 | 0.92 | 1.26 |
+| Index pad flat | 7 | 1.19 | 0.97 |
+| Thumb pad flat | 7 | 2.07 | 0.65 |
+| Finger side ~45° | 4 | 2.36 | 0.50 |
+| Finger side lengthwise | 9 | 3.70 | 0.42 |
+| Finger full side flat | 2 | 10.89 | 0.24 |
+| Hand edge (karate chop) | 1 | 14.11 | 0.21 |
+| Palm partial (heel) | 2 | 24.56 | 0.12 |
+| Palm full | 4 | 35.69 | 0.13 |
 
-Two findings contradict naive interpretations of the field:
+**Overall trend:** from feather touch (size 0.26, ratio 2.38) to full palm (size 35.7,
+ratio 0.13), contact area spans 100× while ratio decreases monotonically. The
+relationship is smooth enough that ratio alone gives a coarse but consistent encoding
+of contact geometry across all 87 measurements.
 
-- **Finding 1**: within finger interactions, raw *decreases* slightly as force increases
-  (touch > click > Force Click). The difference is within noise (~0.04–0.07), so click
-  stage is undetectable. This rules out "raw encodes pressing force."
+**Force Click haptic artifact:** the two near-zero rows (raw ≈ 0.22, size ≈ 0.09,
+ratio ≈ 2.38) previously seemed anomalous. With the full dataset they fall exactly
+on the trend line — they are ordinary "barely-there contact" readings, not a field
+anomaly. The artifact arises because a fast Force Click causes the trackpad's haptic
+engine to briefly interrupt capacitive contact, ending the session at the initial
+light-press frame before the heavier press is recorded. Slow or sustained Force Click
+avoids this and gives size ≈ 1.0, ratio ≈ 1.6.
 
-- **Finding 2**: palm raw is only 3× finger raw, but palm size is 56× finger size.
-  If raw were total force it should be independent of area. It isn't.
-  This rules out "raw encodes total force."
+**Finger independence:** all four fingers (index, middle, ring, thumb) give ratio
+2.33–2.36 for vertical fingertip contact. The field encodes contact geometry, not
+which finger is used.
 
-Both assumptions fail simultaneously.
+**Click stage detection:** click, hard click, and Force Click overlap heavily in both
+raw and ratio. The field cannot distinguish them reliably.
+
+### Known bug: multi-finger touches are not aggregated
+
+The analysis code selects only the contact with the highest raw value per frame — it
+does not sum or average across simultaneous contacts. As a result, the "two-finger"
+and "three-finger" categories in the table above do not represent combined contact
+area; they reflect whichever single finger had the highest raw value at each frame.
+
+This was discovered after an unexplained paradox (2-finger sessions showing
+*larger* average size than 3-finger sessions) led to a code review. What is confirmed:
+the max-only selection. What is **not** confirmed: the cause of the paradox. Two
+candidate explanations — capacitive crosstalk between adjacent contacts inflating the
+detected size of neighboring fingers, vs. inconsistent finger selection (different
+fingers dominating in each test condition) — cannot be distinguished with the current
+data. The "손가락 개수" (finger-count) categories should be treated as unreliable.
 
 ### Limitations
 
 The field at offset 92 is neither pressure (force/area) nor total force. The best
 current hypothesis is an **internal contact geometry metric** used for palm rejection —
-the ratio (raw/size) cleanly separates fingers (~2.0) from palms (~0.1), which is
-exactly the discriminant needed for that purpose.
+the ratio (raw/size) monotonically separates fingertip (~2.3) from palm (~0.1) across
+87 measurements, which is exactly the discriminant needed for that purpose.
 
 The color bar is a valid indicator of contact presence and palm placement. Force Click
 stage detection from this field is not viable.
