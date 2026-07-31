@@ -3,30 +3,27 @@
 
 ## Features
 
-- **Tap detection** - taps/hits on the laptop body (via the accelerometer) play a random
-  macOS system sound.
-- **Lid angle** - reads the hinge angle sensor in real time.
-- **Parking-sensor warning beep** - as the lid angle approaches the hinge's mechanical
-  limit, an audible beep speeds up smoothly (exponential curve), just like a car's
-  reversing sensor. The thresholds (`LID_DANGER_START` / `LID_DANGER_MAX`) were tuned for a
-  **MacBook Air M4 13"** and may need adjusting on other models.
-- **Trackpad haptic feedback** - each warning beep is paired with a short haptic tap via
-  `NSHapticFeedbackManager` (raw ObjC runtime call) on Force Touch trackpads.
-  > **Known limitation**: macOS only fires the Taptic Engine while it detects a finger
-  > on the trackpad (capacitive touch) - this is by design, so the haptic only helps
-  > when a hand is resting on the trackpad.
-- **Keyboard backlight flash** - while the warning is active, the keyboard backlight
-  flashes in sync with each beep via `KeyboardBrightnessClient` (raw ObjC runtime call,
-  `CoreBrightness.framework`), then restores the original brightness once the lid
-  returns to a safe angle.
-- **Ambient light sensor** - real-time lux reading.
-- **Battery** - percentage, temperature, voltage/current, charging state, cycle count
-  (via `ioreg`).
-- **Wi-Fi** - SSID, RSSI, channel (via `wdutil info`).
-- **CPU / GPU / ANE power** - live Watts via `powermetrics`.
-- **Thermal state** - `NSProcessInfo.thermalState` via raw ObjC runtime calls.
-- **Trackpad contact bar** - real-time color bar (blue → red) showing contact intensity
-  via `MultitouchSupport.framework` (no root required). See implementation notes below.
+**Hardware sensors**
+- Accelerometer (tap/hit detection)
+- Lid angle (hinge sensor)
+- Ambient light sensor (lux)
+- Trackpad multitouch (contact geometry via `MultitouchSupport.framework`)
+- Battery telemetry (%, temp, current, cycle count, health)
+- Thermal state (`NSProcessInfo`)
+- CPU / GPU / ANE power (via `powermetrics`)
+- Wi-Fi (SSID, RSSI, channel via `wdutil`)
+
+**Interactive features**
+- **Tap-to-sound** — hits on the laptop body play a random system sound
+- **Parking-sensor lid warning** — beep rate speeds up exponentially as the hinge
+  approaches its mechanical limit, paired with haptic feedback and keyboard backlight
+  flash. Thresholds tuned for MacBook Air M4 13"; other models may need adjustment.
+- **Trackpad contact bar** — real-time blue→red color bar driven by raw multitouch
+  data (no root required). See implementation notes below.
+
+> **Haptic limitation**: macOS only fires the Taptic Engine when a finger is detected
+> on the trackpad (capacitive touch). Haptic feedback during lid warnings only works
+> when a hand is resting on the trackpad.
 
 ## Technologies
 
@@ -139,6 +136,16 @@ exactly +96.
 
 ### Experimental results
 
+**Quick reference — ratio by contact type**
+
+| Contact | avg ratio |
+|---|---|
+| Fingertip (vertical, any finger) | ~2.35 |
+| Flat finger / pad | ~0.97 |
+| Finger side | ~0.42 |
+| Palm edge / hand edge | ~0.18 |
+| Full palm | ~0.13 |
+
 87 session-peak measurements collected on MacBook Air M4 across 19 contact
 categories (offset 92 and offset 48 simultaneously). Each row is the within-session
 maximum for the contact with the highest raw value.
@@ -202,10 +209,29 @@ data. The "손가락 개수" (finger-count) categories should be treated as unre
 
 ### Limitations
 
-The field at offset 92 is neither pressure (force/area) nor total force. The best
-current hypothesis is an **internal contact geometry metric** used for palm rejection —
-the ratio (raw/size) monotonically separates fingertip (~2.3) from palm (~0.1) across
-87 measurements, which is exactly the discriminant needed for that purpose.
+The field at offset 92 is neither pressure (force/area) nor total force. Across 87
+measurements, ratio decreases monotonically from fingertip (~2.35) to full palm
+(~0.13), making it a plausible contact-geometry metric rather than a force signal.
+While Apple's internal definition remains undocumented, its behavior matches what
+would be expected from a palm-rejection discriminator — the ratio cleanly separates
+fingertip contact from broad or palm contact across all tested conditions.
 
 The color bar is a valid indicator of contact presence and palm placement. Force Click
 stage detection from this field is not viable.
+
+---
+
+## Conclusion
+
+Although Apple's internal meaning of offset 92 remains undocumented, 87 measurements
+across 19 contact types show that it consistently tracks contact geometry across a
+wide range of touch conditions. The ratio (raw/size) decreases monotonically as
+contact area grows — from a sharp fingertip to a full palm — with no overlap between
+the extremes. This makes it a reliable signal for visualizing touch intensity and
+distinguishing fingertip from palm contact, even if it cannot detect click stages or
+Force Click reliably.
+
+The implementation also confirmed two independent reasons NSEvent is unsuitable in
+this context (pyobjc/Tkinter initialization conflict; root process has no window
+server session), making `MultitouchSupport.framework` via ctypes the only viable
+approach for this project's architecture.
