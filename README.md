@@ -20,10 +20,8 @@
   flash. Thresholds tuned for MacBook Air M4 13"; other models may need adjustment.
 - **Trackpad contact bar** — real-time blue→red color bar driven by raw multitouch
   data (no root required). See implementation notes below.
-
-> **Haptic limitation**: macOS only fires the Taptic Engine when a finger is detected
-> on the trackpad (capacitive touch). Haptic feedback during lid warnings only works
-> when a hand is resting on the trackpad.
+- **Trackpad touch map** — live view of every contact on the trackpad, drawn as a
+  rotated ellipse (position, major/minor axis, angle) with its finger ID.
 
 ## Technologies
 
@@ -67,6 +65,8 @@ sudo venv/bin/python3 tap_sound.py [threshold]
   is resting on the trackpad.
 - Lid angle thresholds were tuned on a MacBook Air M4 13" and may need adjusting
   on other models.
+- The trackpad touch map shows the firmware's per-finger ellipse, not the raw
+  capacitive image — raw sensor images are not exposed on this hardware (see below).
 - This project relies on undocumented Apple private frameworks
   (`MultitouchSupport`, `CoreBrightness`). Future macOS releases may change or
   remove these interfaces without notice.
@@ -200,12 +200,13 @@ and "three-finger" categories in the table above do not represent combined conta
 area; they reflect whichever single finger had the highest raw value at each frame.
 
 This was discovered after an unexplained paradox (2-finger sessions showing
-*larger* average size than 3-finger sessions) led to a code review. What is confirmed:
+*larger* average size than 3-finger sessions; the 3-finger sessions were dropped
+from the table above) led to a code review. What is confirmed:
 the max-only selection. What is **not** confirmed: the cause of the paradox. Two
 candidate explanations — capacitive crosstalk between adjacent contacts inflating the
 detected size of neighboring fingers, vs. inconsistent finger selection (different
 fingers dominating in each test condition) — cannot be distinguished with the current
-data. The "손가락 개수" (finger-count) categories should be treated as unreliable.
+data. The finger-count categories should be treated as unreliable.
 
 ### Limitations
 
@@ -218,6 +219,50 @@ fingertip contact from broad or palm contact across all tested conditions.
 
 The color bar is a valid indicator of contact presence and palm placement. Force Click
 stage detection from this field is not viable.
+
+---
+
+## Implementation notes: trackpad touch map
+
+### MTContact fields used
+
+The touch map reads more fields from the same 96-byte `MTContact` struct. Offsets
+32/36/48/56/92 were confirmed empirically (see above); the rest follow the
+community-documented layout, which agrees with every offset measured so far.
+
+| Offset | Type | Field |
+|---|---|---|
+| 16 | int | finger identifier (stable while the finger stays down) |
+| 20 | int | touch state (4 = make, 5 = touching, 6 = break) |
+| 32 / 36 | float | normalized x / y (y grows upward) |
+| 48 | float | contact size |
+| 56 | float | ellipse angle (radians) |
+| 60 / 64 | float | ellipse major / minor axis |
+| 92 | float | contact-geometry field used by the bar |
+
+Contacts in states 4–6 are drawn filled; hovering/lifting contacts are drawn as
+outlines only. The canvas matches the sensor surface aspect ratio reported by
+`MTDeviceGetSensorSurfaceDimensions` (121.94 × 74.08 mm on MacBook Air M4 13").
+`_AXIS_PX` scales the ellipse axes to canvas pixels.
+
+### Why not the raw capacitive image?
+
+The trackpad has a 26 × 18 sensor grid (`MTDeviceGetSensorDimensions`), and
+`MultitouchSupport` exports several image-style callbacks. Probing them on a
+MacBook Air M4 while touching the trackpad:
+
+| Callback | Fires? |
+|---|---|
+| `MTRegisterContactFrameCallback` | yes |
+| `MTRegisterFullFrameCallback` | yes |
+| `MTRegisterImageCallback` | no |
+| `MTRegisterMultitouchImageCallback` | no |
+
+The full-frame buffer length is exactly **38 + 30 × contacts** bytes (38 / 98 /
+128 / 158 for 0–3 contacts) and does not grow for a full palm, so it is a
+per-contact report from the firmware, not a 26 × 18 image. The trackpad firmware
+processes the capacitive image internally and only exposes per-finger ellipses,
+so the ellipse is the most faithful shape the touch map can show.
 
 ---
 
