@@ -93,9 +93,10 @@ def trigger_haptic():
     _send_void_ll(performer, _sel_performFeedback, NS_HAPTIC_PATTERN_GENERIC, NS_HAPTIC_PERFORMANCE_TIME_NOW)
 
 
-# --- HID temperature sensors (battery) ---
+# --- HID temperature sensors (battery / SoC die / NAND) ---
 # Newer macOS no longer publishes "Temperature" in the AppleSmartBattery ioreg entry,
 # but the battery gas gauge still reports through IOHIDEventSystem (no root needed).
+# The same service list also carries SoC die ("PMU tdie*") and NAND sensors.
 _iokit = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/IOKit.framework/IOKit")
 _cfl = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
 
@@ -129,7 +130,12 @@ _CF_NUMBER_SINT32 = 3
 _HID_USAGE_PAGE_APPLE_VENDOR = 0xFF00
 _HID_USAGE_TEMPERATURE_SENSOR = 5
 _HID_EVENT_TYPE_TEMPERATURE = 15
-BATTERY_SENSOR_NAME = "gas gauge battery"
+# Sensor groups, matched by the service's "Product" name
+_TEMP_GROUPS = {
+    "battery": lambda name: name == "gas gauge battery",  # one per cell
+    "soc": lambda name: "tdie" in name,                    # PMU / PMU2 die sensors
+    "nand": lambda name: name.startswith("NAND"),
+}
 
 
 def _cfstr(text):
@@ -141,7 +147,7 @@ def _cfint(value):
     return _cfl.CFNumberCreate(None, _CF_NUMBER_SINT32, ctypes.byref(v))
 
 
-def _find_battery_temp_services():
+def _find_temp_services():
     keys = (ctypes.c_void_p * 2)(_cfstr("PrimaryUsagePage"), _cfstr("PrimaryUsage"))
     values = (ctypes.c_void_p * 2)(_cfint(_HID_USAGE_PAGE_APPLE_VENDOR), _cfint(_HID_USAGE_TEMPERATURE_SENSOR))
     matching = _cfl.CFDictionaryCreate(
@@ -152,37 +158,57 @@ def _find_battery_temp_services():
     client = _iokit.IOHIDEventSystemClientCreate(None)
     _iokit.IOHIDEventSystemClientSetMatching(client, matching)
     services = _iokit.IOHIDEventSystemClientCopyServices(client)
+    found = {group: [] for group in _TEMP_GROUPS}
     if not services:
-        return client, []
+        return client, found
 
     product_key = _cfstr("Product")
     buf = ctypes.create_string_buffer(128)
-    found = []
     for i in range(_cfl.CFArrayGetCount(services)):
         svc = _cfl.CFArrayGetValueAtIndex(services, i)
         name = _iokit.IOHIDServiceClientCopyProperty(svc, product_key)
         if not name:
             continue
-        if _cfl.CFStringGetCString(name, buf, len(buf), _CF_UTF8) and buf.value.decode() == BATTERY_SENSOR_NAME:
-            found.append(svc)
+        if _cfl.CFStringGetCString(name, buf, len(buf), _CF_UTF8):
+            for group, matches in _TEMP_GROUPS.items():
+                if matches(buf.value.decode()):
+                    found[group].append(svc)
         _cfl.CFRelease(name)
     # client and services stay alive for the whole process so the service refs remain valid
     return client, found
 
 
-_hid_client, _battery_temp_services = _find_battery_temp_services()
+_hid_client, _temp_services = _find_temp_services()
+
+
+def _read_temps(group):
+    temps = []
+    for svc in _temp_services[group]:
+        event = _iokit.IOHIDServiceClientCopyEvent(svc, _HID_EVENT_TYPE_TEMPERATURE, 0, 0)
+        if not event:
+            continue
+        t = _iokit.IOHIDEventGetFloatValue(event, _HID_EVENT_TYPE_TEMPERATURE << 16)
+        _cfl.CFRelease(event)
+        if 0.0 < t < 150.0:  # drop idle / uncalibrated sensors
+            temps.append(t)
+    return temps
 
 
 def read_battery_temperature():
     """Max over the battery gas gauge sensors (one per cell), in °C. None if unavailable."""
-    temps = []
-    for svc in _battery_temp_services:
-        event = _iokit.IOHIDServiceClientCopyEvent(svc, _HID_EVENT_TYPE_TEMPERATURE, 0, 0)
-        if not event:
-            continue
-        temps.append(_iokit.IOHIDEventGetFloatValue(event, _HID_EVENT_TYPE_TEMPERATURE << 16))
-        _cfl.CFRelease(event)
+    temps = _read_temps("battery")
     return max(temps) if temps else None
+
+
+def read_chip_temperatures():
+    """SoC die max/avg and NAND max, in °C. Missing groups are None."""
+    soc = _read_temps("soc")
+    nand = _read_temps("nand")
+    return {
+        "soc_max": max(soc) if soc else None,
+        "soc_avg": sum(soc) / len(soc) if soc else None,
+        "nand": max(nand) if nand else None,
+    }
 
 
 # --- KeyboardBrightnessClient ---
@@ -271,12 +297,15 @@ class SlowMonitor:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._data = {"battery": None, "wifi": None, "thermal": None}
+        self._data = {"battery": None, "wifi": None, "thermal": None, "chip_temps": None}
         self._stop = threading.Event()
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
-        readers = {"battery": read_battery, "wifi": read_wifi, "thermal": read_thermal_state}
+        readers = {
+            "battery": read_battery, "wifi": read_wifi,
+            "thermal": read_thermal_state, "chip_temps": read_chip_temperatures,
+        }
         while not self._stop.is_set():
             for key, reader in readers.items():
                 try:
@@ -556,6 +585,9 @@ class SensorUI(tk.Tk):
         self.thermal_label = tk.Label(self, text="Thermal state: -", font=("Helvetica", 14))
         self.thermal_label.pack(**pad)
 
+        self.chip_temp_label = tk.Label(self, text="Chip temp: measuring...", font=("Helvetica", 14))
+        self.chip_temp_label.pack(**pad)
+
     def _poll(self):
         # Acceleration delta -> tap detection
         for s in self.imu.read_accel():
@@ -681,6 +713,14 @@ class SensorUI(tk.Tk):
         # Thermal state
         if data["thermal"] is not None:
             self.thermal_label.config(text=f"Thermal state: {data['thermal']}")
+
+        # SoC die / NAND temperature
+        chip = data["chip_temps"]
+        if chip is not None:
+            fmt = lambda t: f"{t:.1f}°C" if t is not None else "N/A"
+            self.chip_temp_label.config(
+                text=f"Chip temp: SoC {fmt(chip['soc_max'])} (avg {fmt(chip['soc_avg'])})  |  NAND {fmt(chip['nand'])}"
+            )
 
         self.after(SLOW_POLL_MS, self._poll_slow)
 

@@ -10,6 +10,7 @@
 - Trackpad multitouch (contact geometry via `MultitouchSupport.framework`)
 - Battery telemetry (%, temp, current, cycle count, health)
 - Thermal state (`NSProcessInfo`)
+- SoC die / NAND temperature (HID temperature sensors)
 - CPU / GPU / ANE power (via `powermetrics`)
 - Wi-Fi (SSID, RSSI, channel via `wdutil`)
 
@@ -28,8 +29,8 @@
 - IOKit / HID (via `macimu`)
 - Objective-C Runtime (raw ctypes calls — no pyobjc)
 - `CoreBrightness.framework` (keyboard backlight)
-- `IOHIDEventSystem` temperature sensors (battery temperature via the "gas gauge
-  battery" sensors — newer macOS no longer publishes `Temperature` in `ioreg`)
+- `IOHIDEventSystem` temperature sensors — battery ("gas gauge battery", since newer
+  macOS no longer publishes `Temperature` in `ioreg`), SoC die (`PMU tdie*`), NAND
 - `MultitouchSupport.framework` (private, trackpad multitouch data)
 - `ioreg` / `wdutil` / `powermetrics` (system CLI tools)
 
