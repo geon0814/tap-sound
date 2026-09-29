@@ -33,8 +33,9 @@ LID_BEEP_SLOW_MS = 1000
 LID_BEEP_FAST_MS = 80
 LID_BEEP_SOUND = "/System/Library/Sounds/Tink.aiff"
 
-# Pressure state — written by NSEvent handler (main thread), read by _poll (main thread)
-_pressure = {"value": 0.0}
+# Trackpad state — written by the MultitouchSupport callback (background thread),
+# read by _poll (main thread). "contacts" is replaced as a whole list each frame.
+_pressure = {"value": 0.0, "contacts": []}
 
 
 def lid_beep_interval(angle):
@@ -172,13 +173,43 @@ def read_wifi():
     return info
 
 
+class SlowMonitor:
+    """Reads battery / Wi-Fi / thermal off the main thread (wdutil and ioreg can block)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._data = {"battery": None, "wifi": None, "thermal": None}
+        self._stop = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        readers = {"battery": read_battery, "wifi": read_wifi, "thermal": read_thermal_state}
+        while not self._stop.is_set():
+            for key, reader in readers.items():
+                try:
+                    value = reader()
+                except Exception as e:
+                    print(f"[{key}] read failed: {e!r}")
+                    continue
+                with self._lock:
+                    self._data[key] = value
+            self._stop.wait(SLOW_POLL_MS / 1000)
+
+    def read(self):
+        with self._lock:
+            return dict(self._data)
+
+    def stop(self):
+        self._stop.set()
+
+
 class PowerMonitor:
     _POWER_RE = re.compile(r"^(?:[A-Z]-)?(CPU|GPU|ANE) Power:\s*(\d+)\s*mW")
     _SAMPLE_RE = re.compile(r"^\*{3} Sampled")
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._data = {"cpu_W": 0.0, "gpu_W": 0.0, "ane_W": 0.0}
+        self._data = {"cpu_W": 0.0, "gpu_W": 0.0, "ane_W": 0.0, "ready": False}
         self._proc = subprocess.Popen(
             ["powermetrics", "-i", "1000", "-s", "cpu_power"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
@@ -187,17 +218,22 @@ class PowerMonitor:
 
     def _run(self):
         cpu_acc = 0.0
+        seen_power = False
         for line in self._proc.stdout:
             line = line.strip()
             if self._SAMPLE_RE.match(line):
-                with self._lock:
-                    self._data["cpu_W"] = cpu_acc
+                # The header opens a sample, so it closes the previous one
+                if seen_power:
+                    with self._lock:
+                        self._data["cpu_W"] = cpu_acc
+                        self._data["ready"] = True
                 cpu_acc = 0.0
                 continue
             m = self._POWER_RE.match(line)
             if not m:
                 continue
             kind, mw = m.group(1), int(m.group(2)) / 1000.0
+            seen_power = True
             if kind == "CPU":
                 cpu_acc += mw
             else:
@@ -220,6 +256,24 @@ def _pressure_color(v):
     b = int(0xff + (0x30 - 0xff) * v)
     return f"#{r:02x}{g:02x}{b:02x}"
 _BAR_W = 260
+# Trackpad map, matching the sensor surface (121.94 x 74.08 mm on MacBook Air M4 13")
+_PAD_W = 260
+_PAD_H = 158
+# Canvas pixels per MTContact axis unit — tune if the ellipses look too big/small
+_AXIS_PX = 2.2
+_TOUCHING_STATES = (4, 5, 6)
+
+
+def _ellipse_points(cx, cy, major, minor, angle, steps=24):
+    # Rotated ellipse as a polygon. Canvas y points down, so the angle is negated.
+    a, b = major / 2 * _AXIS_PX, minor / 2 * _AXIS_PX
+    cos_t, sin_t = math.cos(-angle), math.sin(-angle)
+    pts = []
+    for k in range(steps):
+        t = 2 * math.pi * k / steps
+        ex, ey = a * math.cos(t), b * math.sin(t)
+        pts += [cx + ex * cos_t - ey * sin_t, cy + ex * sin_t + ey * cos_t]
+    return pts
 
 
 class SensorUI(tk.Tk):
@@ -237,11 +291,10 @@ class SensorUI(tk.Tk):
         self.kbd_brightness_saved = None
         self.kbd_flash_on = False
         self.power = PowerMonitor()
+        self.slow = SlowMonitor()
 
         self._build_widgets()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        # Lazy import: AppKit must be imported AFTER tk.Tk() so Tkinter's NSApplication
-        # subclass is already registered before pyobjc wraps it
         self._setup_pressure_monitor()
         self._poll()
         self._poll_slow()
@@ -280,22 +333,49 @@ class SensorUI(tk.Tk):
             ctypes.c_int,     # frame
         )
 
+        # MTContact layout (community reverse-engineering; 32/36/48/56/92 confirmed empirically)
         CONTACT_SIZE = 96
+        ID_OFF = 16        # int: finger identifier, stable while the finger stays down
+        STATE_OFF = 20     # int: touch state (4 = make, 5 = touching, 6 = break)
+        X_OFF = 32         # normalized x (0 = left, 1 = right)
+        Y_OFF = 36         # normalized y (0 = bottom, 1 = top)
+        SIZE_OFF = 48      # contact size
+        ANGLE_OFF = 56     # ellipse angle (radians)
+        MAJOR_OFF = 60     # ellipse major axis
+        MINOR_OFF = 64     # ellipse minor axis
         PRESSURE_OFF = 92
+
+        def _read_float(addr):
+            return ctypes.cast(addr, ctypes.POINTER(ctypes.c_float))[0]
+
+        def _read_int(addr):
+            return ctypes.cast(addr, ctypes.POINTER(ctypes.c_int))[0]
 
         def _mt_callback(device, contacts, n_fingers, timestamp, frame):
             if contacts is None or n_fingers == 0:
                 _pressure["value"] = 0.0
+                _pressure["contacts"] = []
                 return 0
             max_raw = 0.0
+            touches = []
             for i in range(n_fingers):
-                raw = ctypes.cast(
-                    contacts + i * CONTACT_SIZE + PRESSURE_OFF,
-                    ctypes.POINTER(ctypes.c_float),
-                )[0]
+                base = contacts + i * CONTACT_SIZE
+                raw = _read_float(base + PRESSURE_OFF)
+                touches.append({
+                    "id": _read_int(base + ID_OFF),
+                    "state": _read_int(base + STATE_OFF),
+                    "x": _read_float(base + X_OFF),
+                    "y": _read_float(base + Y_OFF),
+                    "size": _read_float(base + SIZE_OFF),
+                    "angle": _read_float(base + ANGLE_OFF),
+                    "major": _read_float(base + MAJOR_OFF),
+                    "minor": _read_float(base + MINOR_OFF),
+                    "raw": raw,
+                })
                 if raw > max_raw:
                     max_raw = raw
             _pressure["value"] = min(max_raw / 2.0, 1.0)
+            _pressure["contacts"] = touches
             return 0
 
         cb = _MT_CB(_mt_callback)
@@ -315,7 +395,11 @@ class SensorUI(tk.Tk):
         threading.Thread(target=_run, daemon=True).start()
 
     def _on_close(self):
+        if self.kbd_brightness_saved is not None:
+            set_keyboard_brightness(self.kbd_brightness_saved)
+            self.kbd_brightness_saved = None
         self.power.stop()
+        self.slow.stop()
         self.destroy()
 
     def _build_widgets(self):
@@ -337,7 +421,7 @@ class SensorUI(tk.Tk):
         tk.Frame(self, height=2, bd=1, relief="sunken").pack(fill="x", padx=10, pady=8)
 
         # --- Trackpad pressure ---
-        tk.Label(self, text="Trackpad Pressure", font=("Helvetica", 12)).pack(**pad)
+        tk.Label(self, text="Trackpad Contact", font=("Helvetica", 12)).pack(**pad)
         self.pressure_canvas = tk.Canvas(
             self, width=_BAR_W, height=26,
             highlightthickness=1, highlightbackground="#aaa",
@@ -346,11 +430,11 @@ class SensorUI(tk.Tk):
         self.pressure_bar = self.pressure_canvas.create_rectangle(0, 0, 0, 26, fill="#4a9eff", outline="")
         self.pressure_info = tk.Label(self, text="0.000  |  —", font=("Helvetica", 14))
         self.pressure_info.pack(**pad)
-        tk.Label(
-            self,
-            text="No response? System Settings > Privacy > Accessibility > Terminal",
-            font=("Helvetica", 10), fg="gray",
-        ).pack()
+        self.pad_canvas = tk.Canvas(
+            self, width=_PAD_W, height=_PAD_H, bg="#f4f4f4",
+            highlightthickness=1, highlightbackground="#aaa",
+        )
+        self.pad_canvas.pack(**pad)
 
         tk.Frame(self, height=2, bd=1, relief="sunken").pack(fill="x", padx=10, pady=8)
 
@@ -439,20 +523,46 @@ class SensorUI(tk.Tk):
         bar_w = int(_BAR_W * pval)
         self.pressure_canvas.coords(self.pressure_bar, 0, 0, bar_w, 26)
         self.pressure_canvas.itemconfig(self.pressure_bar, fill=_pressure_color(pval))
-        self.pressure_info.config(text=f"{pval:.3f}")
+        contacts = _pressure["contacts"]
+        info = f"{pval:.3f}  |  {len(contacts)} contact(s)"
+        if contacts:
+            c = contacts[0]
+            info += f"\nmajor {c['major']:.2f}  minor {c['minor']:.2f}  angle {math.degrees(c['angle']):.0f}°  state {c['state']}"
+        self.pressure_info.config(text=info)
+
+        # Trackpad touch map
+        self.pad_canvas.delete("touch")
+        for c in contacts:
+            cx = c["x"] * _PAD_W
+            cy = (1.0 - c["y"]) * _PAD_H  # MT y grows upward, canvas y grows downward
+            color = _pressure_color(min(c["raw"] / 2.0, 1.0))
+            touching = c["state"] in _TOUCHING_STATES
+            self.pad_canvas.create_polygon(
+                _ellipse_points(cx, cy, max(c["major"], 1.0), max(c["minor"], 1.0), c["angle"]),
+                # Hovering / lifting contacts are drawn as outlines only
+                fill=color if touching else "", outline=color, width=1 if touching else 2,
+                smooth=True, tags="touch",
+            )
+            self.pad_canvas.create_text(
+                cx, cy, text=str(c["id"]), font=("Helvetica", 9), fill="white", tags="touch",
+            )
 
         # CPU/GPU/ANE power
         p = self.power.read()
-        cpu_str = f"{p['cpu_W']:.2f}W (N/A macOS 27 dev golden b bug)" if p['cpu_W'] == 0.0 else f"{p['cpu_W']:.2f}W"
-        self.power_label.config(
-            text=f"Power: CPU {cpu_str}  /  GPU {p['gpu_W']:.2f}W  /  ANE {p['ane_W']:.2f}W"
-        )
+        if not p["ready"]:
+            self.power_label.config(text="Power: measuring...")
+        else:
+            self.power_label.config(
+                text=f"Power: CPU {p['cpu_W']:.2f}W  /  GPU {p['gpu_W']:.2f}W  /  ANE {p['ane_W']:.2f}W"
+            )
 
         self.after(POLL_MS, self._poll)
 
     def _poll_slow(self):
+        data = self.slow.read()
+
         # Battery
-        battery = read_battery()
+        battery = data["battery"]
         if battery is not None:
             state = "Charging" if battery["is_charging"] else "Discharging"
             temp_str = f"{battery['temperature']:.1f}°C" if battery["temperature"] is not None else "N/A"
@@ -466,7 +576,7 @@ class SensorUI(tk.Tk):
             )
 
         # Wi-Fi
-        wifi = read_wifi()
+        wifi = data["wifi"]
         if wifi:
             self.wifi_label.config(
                 text=(
@@ -476,7 +586,8 @@ class SensorUI(tk.Tk):
             )
 
         # Thermal state
-        self.thermal_label.config(text=f"Thermal state: {read_thermal_state()}")
+        if data["thermal"] is not None:
+            self.thermal_label.config(text=f"Thermal state: {data['thermal']}")
 
         self.after(SLOW_POLL_MS, self._poll_slow)
 
