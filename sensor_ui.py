@@ -422,6 +422,8 @@ class SensorUI(tk.Tk):
         self._poll_slow()
 
     def _setup_pressure_monitor(self):
+        self._mt = None
+        self._mt_devices = []
         try:
             _mt = ctypes.cdll.LoadLibrary(
                 "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport"
@@ -445,6 +447,11 @@ class SensorUI(tk.Tk):
         _mt.MTRegisterContactFrameCallback.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         _mt.MTDeviceStart.restype = None
         _mt.MTDeviceStart.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        _mt.MTDeviceStop.restype = None
+        _mt.MTDeviceStop.argtypes = [ctypes.c_void_p]
+        _mt.MTUnregisterContactFrameCallback.restype = None
+        _mt.MTUnregisterContactFrameCallback.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self._mt = _mt
 
         _MT_CB = ctypes.CFUNCTYPE(
             ctypes.c_int,
@@ -511,12 +518,22 @@ class SensorUI(tk.Tk):
                 dev = _cf.CFArrayGetValueAtIndex(devices, i)
                 _mt.MTRegisterContactFrameCallback(dev, cb)
                 _mt.MTDeviceStart(dev, 0)
+                self._mt_devices.append(dev)
             print(f"[pressure] MultitouchSupport: {n_devices} device(s) started")
             _cf.CFRunLoopRun()
 
         threading.Thread(target=_run, daemon=True).start()
 
+    def _stop_multitouch(self):
+        # Stop devices before exit so the callback isn't invoked during interpreter
+        # teardown (otherwise closing the window segfaults)
+        for dev in self._mt_devices:
+            self._mt.MTUnregisterContactFrameCallback(dev, self._mt_callback_ref)
+            self._mt.MTDeviceStop(dev)
+        self._mt_devices = []
+
     def _on_close(self):
+        self._stop_multitouch()
         if self.kbd_brightness_saved is not None:
             set_keyboard_brightness(self.kbd_brightness_saved)
             self.kbd_brightness_saved = None
