@@ -28,6 +28,8 @@
 - IOKit / HID (via `macimu`)
 - Objective-C Runtime (raw ctypes calls — no pyobjc)
 - `CoreBrightness.framework` (keyboard backlight)
+- `IOHIDEventSystem` temperature sensors (battery temperature via the "gas gauge
+  battery" sensors — newer macOS no longer publishes `Temperature` in `ioreg`)
 - `MultitouchSupport.framework` (private, trackpad multitouch data)
 - `ioreg` / `wdutil` / `powermetrics` (system CLI tools)
 

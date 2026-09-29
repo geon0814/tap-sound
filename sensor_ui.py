@@ -93,6 +93,98 @@ def trigger_haptic():
     _send_void_ll(performer, _sel_performFeedback, NS_HAPTIC_PATTERN_GENERIC, NS_HAPTIC_PERFORMANCE_TIME_NOW)
 
 
+# --- HID temperature sensors (battery) ---
+# Newer macOS no longer publishes "Temperature" in the AppleSmartBattery ioreg entry,
+# but the battery gas gauge still reports through IOHIDEventSystem (no root needed).
+_iokit = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/IOKit.framework/IOKit")
+_cfl = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+
+for _name, _res, _args in [
+    ("IOHIDEventSystemClientCreate", ctypes.c_void_p, [ctypes.c_void_p]),
+    ("IOHIDEventSystemClientSetMatching", None, [ctypes.c_void_p, ctypes.c_void_p]),
+    ("IOHIDEventSystemClientCopyServices", ctypes.c_void_p, [ctypes.c_void_p]),
+    ("IOHIDServiceClientCopyProperty", ctypes.c_void_p, [ctypes.c_void_p, ctypes.c_void_p]),
+    ("IOHIDServiceClientCopyEvent", ctypes.c_void_p,
+     [ctypes.c_void_p, ctypes.c_int64, ctypes.c_int32, ctypes.c_int64]),
+    ("IOHIDEventGetFloatValue", ctypes.c_double, [ctypes.c_void_p, ctypes.c_int32]),
+]:
+    getattr(_iokit, _name).restype = _res
+    getattr(_iokit, _name).argtypes = _args
+
+for _name, _res, _args in [
+    ("CFStringCreateWithCString", ctypes.c_void_p, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]),
+    ("CFStringGetCString", ctypes.c_bool, [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]),
+    ("CFNumberCreate", ctypes.c_void_p, [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]),
+    ("CFDictionaryCreate", ctypes.c_void_p,
+     [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]),
+    ("CFArrayGetCount", ctypes.c_long, [ctypes.c_void_p]),
+    ("CFArrayGetValueAtIndex", ctypes.c_void_p, [ctypes.c_void_p, ctypes.c_long]),
+    ("CFRelease", None, [ctypes.c_void_p]),
+]:
+    getattr(_cfl, _name).restype = _res
+    getattr(_cfl, _name).argtypes = _args
+
+_CF_UTF8 = 0x08000100
+_CF_NUMBER_SINT32 = 3
+_HID_USAGE_PAGE_APPLE_VENDOR = 0xFF00
+_HID_USAGE_TEMPERATURE_SENSOR = 5
+_HID_EVENT_TYPE_TEMPERATURE = 15
+BATTERY_SENSOR_NAME = "gas gauge battery"
+
+
+def _cfstr(text):
+    return _cfl.CFStringCreateWithCString(None, text.encode(), _CF_UTF8)
+
+
+def _cfint(value):
+    v = ctypes.c_int32(value)
+    return _cfl.CFNumberCreate(None, _CF_NUMBER_SINT32, ctypes.byref(v))
+
+
+def _find_battery_temp_services():
+    keys = (ctypes.c_void_p * 2)(_cfstr("PrimaryUsagePage"), _cfstr("PrimaryUsage"))
+    values = (ctypes.c_void_p * 2)(_cfint(_HID_USAGE_PAGE_APPLE_VENDOR), _cfint(_HID_USAGE_TEMPERATURE_SENSOR))
+    matching = _cfl.CFDictionaryCreate(
+        None, keys, values, 2,
+        ctypes.addressof(ctypes.c_void_p.in_dll(_cfl, "kCFTypeDictionaryKeyCallBacks")),
+        ctypes.addressof(ctypes.c_void_p.in_dll(_cfl, "kCFTypeDictionaryValueCallBacks")),
+    )
+    client = _iokit.IOHIDEventSystemClientCreate(None)
+    _iokit.IOHIDEventSystemClientSetMatching(client, matching)
+    services = _iokit.IOHIDEventSystemClientCopyServices(client)
+    if not services:
+        return client, []
+
+    product_key = _cfstr("Product")
+    buf = ctypes.create_string_buffer(128)
+    found = []
+    for i in range(_cfl.CFArrayGetCount(services)):
+        svc = _cfl.CFArrayGetValueAtIndex(services, i)
+        name = _iokit.IOHIDServiceClientCopyProperty(svc, product_key)
+        if not name:
+            continue
+        if _cfl.CFStringGetCString(name, buf, len(buf), _CF_UTF8) and buf.value.decode() == BATTERY_SENSOR_NAME:
+            found.append(svc)
+        _cfl.CFRelease(name)
+    # client and services stay alive for the whole process so the service refs remain valid
+    return client, found
+
+
+_hid_client, _battery_temp_services = _find_battery_temp_services()
+
+
+def read_battery_temperature():
+    """Max over the battery gas gauge sensors (one per cell), in °C. None if unavailable."""
+    temps = []
+    for svc in _battery_temp_services:
+        event = _iokit.IOHIDServiceClientCopyEvent(svc, _HID_EVENT_TYPE_TEMPERATURE, 0, 0)
+        if not event:
+            continue
+        temps.append(_iokit.IOHIDEventGetFloatValue(event, _HID_EVENT_TYPE_TEMPERATURE << 16))
+        _cfl.CFRelease(event)
+    return max(temps) if temps else None
+
+
 # --- KeyboardBrightnessClient ---
 ctypes.cdll.LoadLibrary("/System/Library/PrivateFrameworks/CoreBrightness.framework/CoreBrightness")
 
@@ -143,9 +235,10 @@ def read_battery():
     design_capacity = nested.get("DesignCapacity", data.get("DesignCapacity"))
     max_capacity = nested.get("FullChargeCapacity", data.get("AppleRawMaxCapacity"))
     temperature = data.get("Temperature")
+    temperature = temperature / 100.0 if temperature is not None else read_battery_temperature()
 
     return {
-        "temperature": temperature / 100.0 if temperature is not None else None,
+        "temperature": temperature,
         "voltage": data["Voltage"] / 1000.0,
         "amperage": data["Amperage"],
         "percent": data["CurrentCapacity"],
