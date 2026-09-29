@@ -148,7 +148,9 @@ exactly +96.
 
 87 session-peak measurements collected on MacBook Air M4 across 19 contact
 categories (offset 92 and offset 48 simultaneously). Each row is the within-session
-maximum for the contact with the highest raw value.
+maximum for the contact with the highest raw value. Collected with
+`tools/measure_contact.py` (no root required), which prints one
+`raw / size / ratio` line per touch session.
 
 | Contact type | n | avg size | avg ratio |
 |---|---|---|---|
